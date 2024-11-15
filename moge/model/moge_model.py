@@ -12,13 +12,30 @@ import torch.nn.functional as F
 import torch.utils
 import torch.utils.checkpoint
 import torch.version
-import utils3d
+# import utils3d
 from huggingface_hub import hf_hub_download
 
-from ..utils.geometry_torch import image_plane_uv, point_map_to_depth, gaussian_blur_2d
-from .utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
-from ..utils.tools import timeit
+# from ..utils.geometry_torch import image_plane_uv, point_map_to_depth, gaussian_blur_2d
+# from .utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+# from ..utils.tools import timeit
 
+def wrap_dinov2_attention_with_sdpa(module: nn.Module):
+    assert torch.__version__ >= '2.0', "SDPA requires PyTorch 2.0 or later"
+    class _AttentionWrapper(module.__class__):
+        def forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tensor:
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  # (3, B, H, N, C // H)
+
+            q, k, v = torch.unbind(qkv, 0)      # (B, H, N, C // H)
+
+            x = F.scaled_dot_product_attention(q, k, v, attn_bias)
+            x = x.permute(0, 2, 1, 3).reshape(B, N, C) 
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+    module.__class__ = _AttentionWrapper
+    return module
 
 class ResidualConvBlock(nn.Module):  
     def __init__(self, in_channels: int, out_channels: int = None, hidden_channels: int = None, padding_mode: str = 'replicate', activation: Literal['relu', 'leaky_relu', 'silu', 'elu'] = 'relu', norm: Literal['group_norm', 'layer_norm'] = 'group_norm'):  
@@ -107,38 +124,38 @@ class Head(nn.Module):
             nn.Conv2d(last_conv_channels, dim_out, kernel_size=last_conv_size, stride=1, padding=last_conv_size // 2, padding_mode='replicate'),
         )
             
-    def forward(self, hidden_states: torch.Tensor, image: torch.Tensor):
-        img_h, img_w = image.shape[-2:]
-        patch_h, patch_w = img_h // 14, img_w // 14
+    # def forward(self, hidden_states: torch.Tensor, image: torch.Tensor):
+    #     img_h, img_w = image.shape[-2:]
+    #     patch_h, patch_w = img_h // 14, img_w // 14
 
-        # Process the hidden states
-        x = torch.stack([
-            proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
-                for proj, (feat, clstoken) in zip(self.projects, hidden_states)
-        ], dim=1).sum(dim=1)
+    #     # Process the hidden states
+    #     x = torch.stack([
+    #         proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
+    #             for proj, (feat, clstoken) in zip(self.projects, hidden_states)
+    #     ], dim=1).sum(dim=1)
         
-        # Upsample stage
-        # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
-        for i, block in enumerate(self.upsample_blocks):
-            # UV coordinates is for awareness of image aspect ratio
-            uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
-            uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
-            x = torch.cat([x, uv], dim=1)
-            for layer in block:
-                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+    #     # Upsample stage
+    #     # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
+    #     for i, block in enumerate(self.upsample_blocks):
+    #         # UV coordinates is for awareness of image aspect ratio
+    #         uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+    #         uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+    #         x = torch.cat([x, uv], dim=1)
+    #         for layer in block:
+    #             x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
         
-        # (patch_h * 8, patch_w * 8) -> (img_h, img_w)
-        x = F.interpolate(x, (img_h, img_w), mode="bilinear", align_corners=False)
-        uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
-        uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
-        x = torch.cat([x, uv], dim=1)
+    #     # (patch_h * 8, patch_w * 8) -> (img_h, img_w)
+    #     x = F.interpolate(x, (img_h, img_w), mode="bilinear", align_corners=False)
+    #     uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+    #     uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+    #     x = torch.cat([x, uv], dim=1)
 
-        if isinstance(self.output_block, nn.ModuleList):
-            output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
-        else:
-            output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
+    #     if isinstance(self.output_block, nn.ModuleList):
+    #         output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+    #     else:
+    #         output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
         
-        return output
+    #     return output
 
 
 class MoGeModel(nn.Module):
@@ -243,9 +260,9 @@ class MoGeModel(nn.Module):
         state_dict = torch.hub.load('facebookresearch/dinov2', self.encoder, pretrained=True).state_dict()
         self.backbone.load_state_dict(state_dict)
     
-    def enable_backbone_gradient_checkpointing(self):
-        for i in range(len(self.backbone.blocks)):
-            self.backbone.blocks[i] = wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
+    # def enable_backbone_gradient_checkpointing(self):
+    #     for i in range(len(self.backbone.blocks)):
+    #         self.backbone.blocks[i] = wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
 
     def enable_pytorch_native_sdpa(self):
         for i in range(len(self.backbone.blocks)):
@@ -294,83 +311,83 @@ class MoGeModel(nn.Module):
             return_dict['mask'] = mask
         return return_dict
 
-    @torch.inference_mode()
-    def infer(
-        self, 
-        image: torch.Tensor, 
-        force_projection: bool = True,
-        resolution_level: int = 9,
-        apply_mask: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        User-friendly inference function
+    # @torch.inference_mode()
+    # def infer(
+    #     self, 
+    #     image: torch.Tensor, 
+    #     force_projection: bool = True,
+    #     resolution_level: int = 9,
+    #     apply_mask: bool = True,
+    # ) -> Dict[str, torch.Tensor]:
+    #     """
+    #     User-friendly inference function
 
-        ### Parameters
-        - `image`: input image tensor of shape (B, 3, H, W) or (3, H, W)
-        - `resolution_level`: the resolution level to use for the output point map in 0-9. Default: 9 (highest)
-        - `interpolation_mode`: interpolation mode for the output points map. Default: 'bilinear'.
+    #     ### Parameters
+    #     - `image`: input image tensor of shape (B, 3, H, W) or (3, H, W)
+    #     - `resolution_level`: the resolution level to use for the output point map in 0-9. Default: 9 (highest)
+    #     - `interpolation_mode`: interpolation mode for the output points map. Default: 'bilinear'.
             
-        ### Returns
+    #     ### Returns
 
-        A dictionary containing the following keys:
-        - `points`: output tensor of shape (B, H, W, 3) or (H, W, 3).
-        - `depth`: tensor of shape (B, H, W) or (H, W) containing the depth map.
-        - `intrinsics`: tensor of shape (B, 3, 3) or (3, 3) containing the camera intrinsics.
-        """
-        if image.dim() == 3:
-            omit_batch_dim = True
-            image = image.unsqueeze(0)
-        else:
-            omit_batch_dim = False
+    #     A dictionary containing the following keys:
+    #     - `points`: output tensor of shape (B, H, W, 3) or (H, W, 3).
+    #     - `depth`: tensor of shape (B, H, W) or (H, W) containing the depth map.
+    #     - `intrinsics`: tensor of shape (B, 3, 3) or (3, 3) containing the camera intrinsics.
+    #     """
+    #     if image.dim() == 3:
+    #         omit_batch_dim = True
+    #         image = image.unsqueeze(0)
+    #     else:
+    #         omit_batch_dim = False
 
-        original_height, original_width = image.shape[-2:]
-        area = original_height * original_width
+    #     original_height, original_width = image.shape[-2:]
+    #     area = original_height * original_width
 
-        min_area, max_area = self.trained_area_range
-        expected_area = min_area + (max_area - min_area) * (resolution_level / 9)
+    #     min_area, max_area = self.trained_area_range
+    #     expected_area = min_area + (max_area - min_area) * (resolution_level / 9)
         
-        if expected_area != area:
-            expected_width, expected_height = int(original_width * (expected_area / area) ** 0.5), int(original_height * (expected_area / area) ** 0.5)
-            image = F.interpolate(image, (expected_height, expected_width), mode="bicubic", align_corners=False, antialias=True)
+    #     if expected_area != area:
+    #         expected_width, expected_height = int(original_width * (expected_area / area) ** 0.5), int(original_height * (expected_area / area) ** 0.5)
+    #         image = F.interpolate(image, (expected_height, expected_width), mode="bicubic", align_corners=False, antialias=True)
         
-        output = self.forward(image)
-        points, mask = output['points'], output.get('mask', None)
+    #     output = self.forward(image)
+    #     points, mask = output['points'], output.get('mask', None)
 
-        # Get camera-origin-centered point map
-        depth, fov_x, fov_y, z_shift = point_map_to_depth(points, None if mask is None else mask > 0.5)
-        intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov_x, fov_y)
+    #     # Get camera-origin-centered point map
+    #     depth, fov_x, fov_y, z_shift = point_map_to_depth(points, None if mask is None else mask > 0.5)
+    #     intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov_x, fov_y)
         
-        # If projection constraint is forces, recompute the point map using the actual depth map
-        if force_projection:
-            points = utils3d.torch.unproject_cv(utils3d.torch.image_uv(width=expected_width, height=expected_height, dtype=points.dtype, device=points.device), depth, extrinsics=None, intrinsics=intrinsics[..., None, :, :])
-        else:
-            points = points + torch.stack([torch.zeros_like(z_shift), torch.zeros_like(z_shift), z_shift], dim=-1)[..., None, None, :]
+    #     # If projection constraint is forces, recompute the point map using the actual depth map
+    #     if force_projection:
+    #         points = utils3d.torch.unproject_cv(utils3d.torch.image_uv(width=expected_width, height=expected_height, dtype=points.dtype, device=points.device), depth, extrinsics=None, intrinsics=intrinsics[..., None, :, :])
+    #     else:
+    #         points = points + torch.stack([torch.zeros_like(z_shift), torch.zeros_like(z_shift), z_shift], dim=-1)[..., None, None, :]
 
-        # Resize the output to the original resolution
-        if expected_area != area:
-            points = F.interpolate(points.permute(0, 3, 1, 2), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).permute(0, 2, 3, 1)
-            depth = F.interpolate(depth.unsqueeze(1), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).squeeze(1)
-            mask = None if mask is None else F.interpolate(mask.unsqueeze(1), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).squeeze(1)
+    #     # Resize the output to the original resolution
+    #     if expected_area != area:
+    #         points = F.interpolate(points.permute(0, 3, 1, 2), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).permute(0, 2, 3, 1)
+    #         depth = F.interpolate(depth.unsqueeze(1), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).squeeze(1)
+    #         mask = None if mask is None else F.interpolate(mask.unsqueeze(1), (original_height, original_width), mode='bilinear', align_corners=False, antialias=False).squeeze(1)
         
-        # Apply mask if needed
-        if self.output_mask and apply_mask:
-            mask_binary = (depth > 0) & (mask > 0.5)
-            points = torch.where(mask_binary[..., None], points, torch.inf)
-            depth = torch.where(mask_binary, depth, torch.inf)
+    #     # Apply mask if needed
+    #     if self.output_mask and apply_mask:
+    #         mask_binary = (depth > 0) & (mask > 0.5)
+    #         points = torch.where(mask_binary[..., None], points, torch.inf)
+    #         depth = torch.where(mask_binary, depth, torch.inf)
 
-        if omit_batch_dim:
-            points = points.squeeze(0)
-            intrinsics = intrinsics.squeeze(0)
-            depth = depth.squeeze(0)
-            if self.output_mask:
-                mask = mask.squeeze(0)
+    #     if omit_batch_dim:
+    #         points = points.squeeze(0)
+    #         intrinsics = intrinsics.squeeze(0)
+    #         depth = depth.squeeze(0)
+    #         if self.output_mask:
+    #             mask = mask.squeeze(0)
 
-        return_dict = {
-            'points': points,
-            'intrinsics': intrinsics,
-            'depth': depth,
-        }
-        if self.output_mask:
-            return_dict['mask'] = mask > 0.5
+    #     return_dict = {
+    #         'points': points,
+    #         'intrinsics': intrinsics,
+    #         'depth': depth,
+    #     }
+    #     if self.output_mask:
+    #         return_dict['mask'] = mask > 0.5
 
-        return return_dict
+    #     return return_dict
